@@ -67,6 +67,7 @@ Terminate the process: Task Manager.
 
 ## Known limitations
 
+- At runtime, the executable's directory **must** contain at least one of `wallpaper.mp4` or `wallpaper1.mp4`.
 - Screen numbers follow the system enumeration order; rearranging or hot-plugging displays may map `wallpaperN.mp4` to a different physical screen.
 - No DPI awareness yet; mixed-DPI multi-monitor setups may be sized incorrectly.
 - Hot-plug triggers a full rebuild (brief black flash).

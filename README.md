@@ -67,7 +67,7 @@ ActiveDesktop.exe --uninstall     :: 取消开机自启
 
 ## 已知限制
 
-- 运行时同目录下必须至少包含一个 `wallpaper.mp4` 或 `wallpaper1.mp4`。
+- 运行时同目录下**必须**至少包含一个 `wallpaper.mp4` 或 `wallpaper1.mp4`。
 - 屏幕序号按系统枚举顺序，重排显示器或热插拔可能导致 `wallpaperN.mp4` 落到别的物理屏。
 - 暂未做 DPI 感知；混合缩放的多屏可能尺寸不准。
 - 热插拔是全量重建，会有短暂黑闪。
