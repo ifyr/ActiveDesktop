@@ -28,6 +28,8 @@ use super::{config, occupancy, workerw};
 const WINDOW_CLASS: PCWSTR = w!("ActiveDesktopWallpaperWindow");
 const FRAME_INTERVAL: Duration = Duration::from_millis(1000 / 30);
 const OCCUPANCY_INTERVAL: Duration = Duration::from_millis(250);
+const VIDEO_CHECK_TICKS: u64 = 60;
+const VIDEO_SETTLE: Duration = Duration::from_secs(1);
 const WM_DISPLAYCHANGE: u32 = 0x007E;
 const REBUILD_CHECK_TICKS: u64 = 30;
 const REBUILD_MAX_ATTEMPTS: u32 = 10;
@@ -79,6 +81,40 @@ fn next_frame_deadline(now: Instant, next: Instant) -> Instant {
 
 fn should_draw_surface(paused: bool, force: bool, occupied: bool) -> bool {
     !paused && (force || !occupied)
+}
+
+fn desired_video(video_override: Option<&str>, i: usize) -> String {
+    match video_override {
+        Some(v) => v.to_string(),
+        None => config::resolve_video_for(i + 1, &config::exe_dir_or_cwd())
+            .to_string_lossy()
+            .into_owned(),
+    }
+}
+
+fn file_stamp(path: &str) -> (u64, u64) {
+    match std::fs::metadata(path) {
+        Ok(meta) => {
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            (meta.len(), mtime)
+        }
+        Err(_) => (0, 0),
+    }
+}
+
+fn video_stamps_for(groups: &[VideoGroup]) -> Vec<(String, u64, u64)> {
+    groups
+        .iter()
+        .map(|g| {
+            let (len, mtime) = file_stamp(&g.video);
+            (g.video.clone(), len, mtime)
+        })
+        .collect()
 }
 
 fn force_draw_enabled() -> bool {
@@ -198,6 +234,7 @@ struct Session {
     target: HWND,
     monitors: Vec<MonitorSurface>,
     groups: Vec<VideoGroup>,
+    video_stamps: Vec<(String, u64, u64)>,
     video_override: Option<String>,
     display_sig: Vec<(i32, i32, i32, i32)>,
     notify: Option<HWND>,
@@ -362,12 +399,7 @@ impl Session {
                     continue;
                 }
             };
-            let video = match video_override {
-                Some(v) => v.to_string(),
-                None => config::resolve_video_for(i + 1, &config::exe_dir_or_cwd())
-                    .to_string_lossy()
-                    .into_owned(),
-            };
+            let video = desired_video(video_override, i);
             log::info!("engine: monitor[{}] video={:?}", i, video);
             let group = match groups.iter().position(|g| g.video == video) {
                 Some(group) => group,
@@ -417,6 +449,7 @@ impl Session {
         Ok(Self {
             target,
             monitors: surfaces,
+            video_stamps: video_stamps_for(&groups),
             groups,
             video_override: video_override.map(|v| v.to_string()),
             display_sig,
@@ -475,6 +508,32 @@ impl Session {
             }
         }
         Err(last.unwrap_or_else(|| anyhow!("rebuild failed without a recorded error")))
+    }
+
+    fn videos_need_reload(&self) -> bool {
+        for (i, surface) in self.monitors.iter().enumerate() {
+            if desired_video(self.video_override.as_deref(), i) != self.groups[surface.group].video
+            {
+                return true;
+            }
+        }
+        let stamps = video_stamps_for(&self.groups);
+        if stamps == self.video_stamps {
+            return false;
+        }
+        let now = std::time::SystemTime::now();
+        for (path, _, _) in &stamps {
+            if let Ok(modified) = std::fs::metadata(path).and_then(|m| m.modified()) {
+                if now
+                    .duration_since(modified)
+                    .map(|age| age < VIDEO_SETTLE)
+                    .unwrap_or(false)
+                {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     fn monitors_changed(&self) -> bool {
@@ -691,6 +750,20 @@ impl Session {
                         next = Instant::now();
                     }
                 }
+                if !pending_rebuild
+                    && tick.is_multiple_of(VIDEO_CHECK_TICKS)
+                    && self.videos_need_reload()
+                {
+                    log::warn!("engine: wallpaper video changed; reloading");
+                    if let Err(e) = self.rebuild() {
+                        log::error!(
+                            "engine: reload after video change failed: {e:?}; switching to background retry"
+                        );
+                        pending_rebuild = true;
+                        next_rebuild_attempt = Instant::now() + REBUILD_SLOW_RETRY_DELAY;
+                    }
+                    next = Instant::now();
+                }
             }
 
             let now = Instant::now();
@@ -706,8 +779,8 @@ impl Session {
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::{
-        check_rebuild, monitor_signature, next_frame_deadline, should_draw_surface, RebuildReason,
-        FRAME_INTERVAL,
+        check_rebuild, file_stamp, monitor_signature, next_frame_deadline, should_draw_surface,
+        RebuildReason, FRAME_INTERVAL,
     };
     use std::time::{Duration, Instant};
     use windows::Win32::Foundation::RECT;
@@ -725,6 +798,18 @@ mod tests {
         let base = Instant::now();
         let now = base + Duration::from_millis(100);
         assert_eq!(next_frame_deadline(now, base), now);
+    }
+
+    #[test]
+    fn file_stamp_reports_size_and_mtime() {
+        let dir = std::env::temp_dir().join(format!("ad_stamp_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("a.mp4");
+        std::fs::write(&file, b"12345").unwrap();
+        let (len, mtime) = file_stamp(file.to_str().unwrap());
+        assert_eq!(len, 5);
+        assert!(mtime > 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
